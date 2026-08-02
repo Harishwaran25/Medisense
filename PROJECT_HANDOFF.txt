@@ -1,0 +1,273 @@
+================================================================================
+MEDISENSE v5.2 — PROJECT HANDOFF / TRANSFER NOTES
+================================================================================
+Date prepared: 22 July 2026
+Project folder: medisense_v5_restructured
+
+Copy this WHOLE folder to the other laptop (zip or USB).
+Do NOT need to copy: .venv, __pycache__, .env (secrets), *.pt model weights,
+medisense.log — those are recreated on the new machine.
+
+
+================================================================================
+1) WHAT YOU ASKED FOR (conversation summary)
+================================================================================
+
+1. "Improve the overall project"
+   - Broad request to raise quality of the MediSense bedridden patient monitor.
+
+2. "Do all the improvements that is as industry graded and integrate yolo and
+   cv for identification of poses and expressions of lying patients. be careful
+   of the work and complete as soon as possible"
+   - Full reliability + packaging + tests pass.
+   - Integrate YOLO + OpenCV for lying-patient pose and facial expression.
+
+3. "What are the things you added and why"
+   - Asked for a list of changes and reasons (answered in chat).
+
+4. "Is yolo and cv fully integrated and completed?"
+   - Clarified: wired in code, but not fully runtime-verified until deps install.
+
+5. "Make it full complete to production level and avoid errors"
+   - Hardened startup, failover, fallbacks, config validation, safe shutdown.
+
+6. "I'm going to export these files to another laptop for checking. Make sure
+   everything works and create a txt file of what I asked and what you did and
+   how to run the project"
+   - This file. Also verified package imports and file layout for transfer.
+
+
+================================================================================
+2) WHAT WAS DONE TO THE PROJECT
+================================================================================
+
+VERSION: 5.2.0 (was ~5.0 modular restructure)
+
+--- A) Reliability / industry-grade fixes ---
+- Fall detection redesigned for BEDRIDDEN patients:
+  Lying flat is NORMAL. Fall = calibrated torso drop / slide / tumble
+  (old logic wrongly treated lying as a fall).
+- Landmark copying in agitation + stillness (fixes MediaPipe frame aliasing
+  that made movement look like zero).
+- When pose is lost, sticky alerts are cleared (no stale FALL/UNCONSCIOUS).
+- Pain/expression: single worker thread + bounded queue (no thread storm).
+- Alert manager: locked log, stoppable monitor, SMS if Telegram fails,
+  temp WAV file always cleaned up.
+- Config validation; camera offline + pose-lost alerts; signal (Ctrl+C) shutdown.
+- Startup health check fails fast if OpenCV/pose backend broken.
+
+--- B) YOLO + OpenCV integration ---
+NEW package: src/medisense/vision/
+  - landmarks.py  : shared Landmark type; YOLO COCO-17 → MediaPipe indices
+  - pose.py       : YOLO-pose primary, MediaPipe fallback + mid-run failover
+  - face.py       : OpenCV Haar frontal+profile, lying-aware ROI, synthetic
+                    nose crop when Haar misses side-lying faces
+
+Expression path:
+  - OpenCV finds/crops the face
+  - HuggingFace facial-emotion model scores distress (proxy, not clinical)
+  - If HF/torch fail → OpenCV contrast/edge "tense vs calm" fallback so
+    expression channel never goes silent
+
+Main loop (app.py) uses PoseEstimator + FaceFinder every frame.
+
+--- C) Packaging / DX ---
+- .gitignore (secrets, venv, logs, models)
+- Dependencies in pyproject.toml + requirements.txt
+- Entry points:  python -m medisense   OR   medisense
+- __init__.py / __main__.py for clean package run
+- .env.example with Telegram + pose backend + camera + headless flags
+- docs/VALIDATION.md (honest note: not clinically validated)
+- Expanded unit tests under tests/
+
+--- D) Production hardening (v5.2) ---
+- src/medisense/health.py — dependency + pose warm-up check
+- YOLO repeated errors → automatic MediaPipe failover
+- Headless mode (MEDISENSE_HEADLESS=1) for machines without a display
+- Safe handling of empty/bad frames; exit codes 0/1/2
+- UI shows active pose backend (YOLO / MEDIAPIPE)
+
+
+================================================================================
+3) IMPORTANT LIMITATIONS (read before demo)
+================================================================================
+
+- This is a PORTFOLIO / LEARNING project — NOT a certified medical device.
+- "Pain" score is a distress PROXY from emotion labels / CV heuristic —
+  not PSPI/PAINAD clinical pain measurement.
+- Thresholds are hand-tuned; not validated on a labeled video dataset.
+- Telegram / SMS need your own credentials in .env (optional for local demo).
+- First run needs INTERNET to download:
+    * yolov8n-pose.pt (Ultralytics)
+    * HuggingFace emotion model (if using neural expression path)
+
+
+================================================================================
+4) WHAT TO COPY TO THE OTHER LAPTOP
+================================================================================
+
+INCLUDE:
+  src/
+  tests/
+  docs/
+  archive/          (old prototypes — optional, not required to run)
+  pyproject.toml
+  requirements.txt
+  README.md
+  .env.example
+  .gitignore
+  THIS FILE (PROJECT_HANDOFF.txt)
+
+EXCLUDE / DO NOT COPY (or delete on new machine if present):
+  .venv/
+  __pycache__/
+  .env              (create fresh from .env.example)
+  *.pt / model caches
+  medisense.log
+  .pytest_cache/
+
+
+================================================================================
+5) HOW TO RUN ON THE OTHER LAPTOP
+================================================================================
+
+REQUIREMENTS:
+  - Python 3.10 or newer
+  - Webcam
+  - Internet (first install + first model download)
+  - Linux / Windows / macOS with a display (or use HEADLESS=1)
+  - Optional: aplay (Linux) for alarm sound; Termux for SMS fallback
+
+STEP-BY-STEP:
+
+  1) Open a terminal in the project folder
+       cd medisense_v5_restructured
+
+  2) Create and activate a virtual environment
+       python3 -m venv .venv
+
+       Linux / macOS:
+         source .venv/bin/activate
+
+       Windows (PowerShell):
+         .venv\Scripts\Activate.ps1
+
+  3) Install the package + dependencies
+       pip install -U pip setuptools wheel
+       pip install -e ".[dev]"
+
+       ALTERNATIVE if editable install fails:
+         pip install -r requirements.txt
+         pip install -e .
+
+  4) Configure environment
+       cp .env.example .env
+       # Edit .env if you want Telegram alerts.
+       # For a local camera-only demo you can leave Telegram blank
+       # (you will see a warning; monitoring still runs).
+
+  5) Run the app
+       python -m medisense
+
+       Or:
+         medisense
+
+       Quit: press Q in the video window (GUI mode).
+
+  6) Optional settings (in .env or export before run)
+       MEDISENSE_CAM_SOURCE=0
+       MEDISENSE_POSE_BACKEND=auto          # auto | yolo | mediapipe
+       MEDISENSE_YOLO_MODEL=yolov8n-pose.pt
+       MEDISENSE_HEADLESS=0                 # set 1 for no GUI window
+
+  7) Run tests
+       pytest tests/ -v
+
+
+================================================================================
+6) QUICK TROUBLESHOOTING
+================================================================================
+
+"Cannot open camera"
+  - Try MEDISENSE_CAM_SOURCE=1 (or another index)
+  - Close other apps using the webcam
+  - On Linux: check user is in the "video" group
+
+"YOLO pose unavailable" / download failure
+  - Need internet once for yolov8n-pose.pt
+  - Or set MEDISENSE_POSE_BACKEND=mediapipe if MediaPipe is installed
+
+"Health check failed" / no pose backend
+  - pip install ultralytics mediapipe
+  - Re-run: python -m medisense
+
+"Emotion model" / transformers errors
+  - App continues with OpenCV expression fallback automatically
+  - Full neural path needs: pip install torch transformers
+
+GUI / cv2.imshow errors on SSH
+  - MEDISENSE_HEADLESS=1 python -m medisense
+
+Slow first start
+  - Normal: downloading YOLO weights and (optional) HF model
+
+
+================================================================================
+7) PROJECT LAYOUT (what matters)
+================================================================================
+
+medisense_v5_restructured/
+  PROJECT_HANDOFF.txt          ← this file
+  README.md
+  pyproject.toml
+  requirements.txt
+  .env.example
+  .gitignore
+  docs/VALIDATION.md
+  src/medisense/
+    app.py                     ← main loop
+    config.py                  ← thresholds + secrets
+    health.py                  ← startup checks
+    state.py / smoothing.py
+    vision/                    ← YOLO + OpenCV
+    detectors/                 ← fall, agitation, posture, stillness,
+                                 boundary, pain/expression
+    alerting/alert_manager.py
+    ui/render.py
+  tests/                       ← pytest suite
+  archive/                     ← old phase 1–3 prototypes (history only)
+
+
+================================================================================
+8) DEMO CHECKLIST ON THE NEW LAPTOP
+================================================================================
+
+[ ] venv created and activated
+[ ] pip install -e ".[dev]" succeeded
+[ ] .env created from .env.example
+[ ] python -m medisense opens camera window
+[ ] Overlay shows pose backend (YOLO or MEDIAPIPE)
+[ ] Skeleton / person box appears when you are in frame
+[ ] Face box appears when face is visible
+[ ] Press Q to quit cleanly
+[ ] pytest tests/ -v passes (or note any failures)
+
+
+================================================================================
+END OF HANDOFF
+================================================================================
+Created PROJECT_HANDOFF.txt in the project root. It covers:
+
+What you asked (all requests in this chat)
+What was changed (v5.2 improvements, YOLO/CV, hardening)
+How to install and run on the other laptop
+What to copy / skip, troubleshooting, demo checklist
+Transfer tip: zip the whole medisense_v5_restructured folder, but skip .venv, .env, __pycache__, and any .pt files. On the new laptop:
+
+cd medisense_v5_restructured
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -U pip setuptools wheel
+pip install -e ".[dev]"
+cp .env.example .env
+python -m medisense
+Needs Python 3.10+, a webcam, and internet on first run (YOLO weights). Full details are in PROJECT_HANDOFF.txt.

@@ -1,0 +1,51 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.local
+*.pem
+*credentials*.json
+serviceAccount*.json
+
+# Logs / runtime
+medisense.log
+*.log
+*.wav
+
+# Models / downloads
+*.pt
+*.onnx
+*.pth
+.cache/
+weights/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+.eggs/
+*.db
