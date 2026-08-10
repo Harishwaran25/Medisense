@@ -76,9 +76,9 @@ Python · OpenCV · Ultralytics YOLO (pose) · MediaPipe · Hugging Face Transfo
 
 ## Installation
 
+From the repository root:
+
 ```bash
-git clone https://github.com/Harishwaran25/medisense.git
-cd medisense
 pip install -e .
 ```
 
