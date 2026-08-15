@@ -38,16 +38,21 @@ def run_healthcheck(cfg, warm_pose: bool = True) -> HealthReport:
 
     # OpenCV
     try:
-        import cv2
+        import cv2  # noqa: F401
 
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        cascade = cv2.CascadeClassifier(cascade_path)
-        if cascade.empty():
-            report.errors.append(f"Haar cascade failed to load: {cascade_path}")
-            report.ok = False
-            report.checks["opencv"] = False
+        from medisense.vision.cascades import load_cascade
+
+        report.checks["opencv"] = True
+        # Face detection degrades to landmark-derived crops without cascades,
+        # so a missing XML is a warning rather than a startup failure.
+        if load_cascade("haarcascade_frontalface_default.xml") is None:
+            report.checks["haar_cascades"] = False
+            report.warnings.append(
+                "Frontal Haar cascade not found — face detection will rely on "
+                "pose landmarks only."
+            )
         else:
-            report.checks["opencv"] = True
+            report.checks["haar_cascades"] = True
     except Exception as e:
         report.errors.append(f"OpenCV unavailable: {e}")
         report.ok = False

@@ -244,37 +244,9 @@ class PoseEstimator:
             logger.warning("MediaPipe inference failed: %s", e)
             return PoseResult(landmarks=None, backend="mediapipe", error=str(e))
 
-    def draw(self, frame_bgr: np.ndarray, pose: PoseResult) -> None:
-        import cv2
-
-        try:
-            if pose.person_bbox is not None:
-                x1, y1, x2, y2 = pose.person_bbox
-                cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (40, 100, 180), 2)
-
-            if not pose.landmarks:
-                return
-
-            edges = [
-                (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-                (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
-                (24, 26), (26, 28), (0, 11), (0, 12),
-            ]
-            h, w = frame_bgr.shape[:2]
-            pts = {}
-            for i, lm in enumerate(pose.landmarks):
-                if lm.visibility < 0.25:
-                    continue
-                px, py = int(lm.x * w), int(lm.y * h)
-                if not (0 <= px < w and 0 <= py < h):
-                    continue
-                pts[i] = (px, py)
-                cv2.circle(frame_bgr, pts[i], 3, (60, 200, 160), -1, cv2.LINE_AA)
-            for a, b in edges:
-                if a in pts and b in pts:
-                    cv2.line(frame_bgr, pts[a], pts[b], (40, 100, 180), 2, cv2.LINE_AA)
-        except Exception as e:
-            logger.debug("Pose draw skipped: %s", e)
+    # Drawing deliberately lives only in medisense.ui.render. This class used
+    # to draw its own skeleton and bounding box as well, so every frame carried
+    # two skeletons in two different colours on top of each other.
 
     def close(self):
         try:

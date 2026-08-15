@@ -1,193 +1,358 @@
-"""Clinical dark-theme overlay: side panel, alert banner, bed-edge guides,
-skeleton crosshair. Pure drawing code — no detection logic lives here."""
+"""
+Clinical overlay.
+
+Deliberately sparse. The previous panel showed eight blocks including a raw
+`ratio 0.123` diagnostic, two progress bars, a four-entry alert history and a
+full-width red banner across the middle of the video, and it drew two
+different skeletons on top of each other because both the pose backend and the
+renderer were drawing one. At a glance a nurse could not tell what mattered.
+
+What earns space here is what changes a decision: the overall verdict, the
+respiration reading, how long the patient has been still, and three state
+chips. Developer diagnostics are in the log, not on the screen. Anything
+uncertain is labelled as uncertain rather than shown as a number.
+
+Pure drawing code — no detection logic lives here.
+"""
+from __future__ import annotations
+
 import datetime
+import logging
+
 import cv2
-import mediapipe as mp
-_POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
 
 from medisense.config import Thresholds
+from medisense.detectors import breathing as resp
+from medisense.detectors import pain as pain_states
+from medisense.detectors import stillness as still
+from medisense.ui.model import MonitorSnapshot
 
-# Colors (BGR)
-C_PANEL = (28, 32, 42)
-C_BORDER = (45, 55, 70)
-C_OK = (80, 200, 120)
-C_WARN = (40, 160, 240)
-C_CRIT = (60, 60, 220)
-C_TEXT_PRI = (220, 225, 235)
-C_TEXT_SEC = (110, 120, 140)
-C_ACCENT = (140, 210, 255)
-C_BED_LINE = (60, 80, 120)
+logger = logging.getLogger("medisense.ui.render")
 
-def draw_skeleton(frame, landmarks, min_vis=0.5, color=(0, 255, 140)):
+# Drawing must not make MediaPipe a hard requirement. Importing it at module
+# scope meant a YOLO-only install could not start the app at all, even though
+# the pose stack itself treats MediaPipe as optional.
+_FALLBACK_EDGES = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
+    (24, 26), (26, 28), (0, 11), (0, 12),
+]
+
+try:
+    import mediapipe as mp
+
+    _POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
+except Exception as e:  # pragma: no cover - depends on install
+    logger.info("MediaPipe unavailable for skeleton edges — using built-in set: %s", e)
+    _POSE_CONNECTIONS = _FALLBACK_EDGES
+
+# Palette (BGR). Muted, low-saturation, one accent.
+C_BG = (26, 28, 34)
+C_LINE = (48, 52, 62)
+C_TEXT = (228, 231, 238)
+C_DIM = (128, 136, 152)
+C_OK = (120, 190, 130)
+C_WARN = (70, 170, 235)
+C_CRIT = (72, 72, 226)
+C_ACCENT = (188, 172, 120)
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+PANEL_W = 236
+PAD = 14
+
+SEVERITY_COLORS = {"NORMAL": C_OK, "WARNING": C_WARN, "CRITICAL": C_CRIT}
+
+# OpenCV's Hershey fonts are ASCII-only and draw anything else as "???".
+# Messages reach the overlay from several modules, so they are sanitised at
+# draw time rather than by policing every string that produces one.
+_SUBSTITUTIONS = {
+    "\u00b7": "-", "\u2014": "-", "\u2013": "-", "\u2022": "-",
+    "\u2026": "...", "\u00b0": " deg", "\u2265": ">=", "\u2264": "<=",
+    "\u00b1": "+/-", "\u2192": "->", "\u201c": '"', "\u201d": '"',
+    "\u2018": "'", "\u2019": "'",
+}
+
+
+def _severity_color(state: str):
+    return SEVERITY_COLORS.get(state, C_DIM)
+
+
+def ascii_safe(text) -> str:
+    text = str(text)
+    for bad, good in _SUBSTITUTIONS.items():
+        text = text.replace(bad, good)
+    return text.encode("ascii", "replace").decode("ascii")
+
+
+def _put(frame, text, origin, scale, color, thickness=1):
+    cv2.putText(frame, ascii_safe(text), origin, FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+class _Column:
+    """
+    A top-down text cursor, so panel items cannot drift out of alignment.
+
+    With `frame=None` it measures instead of drawing, which lets the panel be
+    sized to its contents rather than stretched down the whole window.
+    """
+
+    def __init__(self, frame, x: int, y: int, width: int):
+        self.frame = frame
+        self.x = x
+        self.y = y
+        self.width = width
+
+    @property
+    def drawing(self) -> bool:
+        return self.frame is not None
+
+    def gap(self, px: int) -> None:
+        self.y += px
+
+    def label(self, text: str) -> None:
+        if self.drawing:
+            _put(self.frame, text.upper(), (self.x, self.y), 0.34, C_DIM)
+        self.y += 15
+
+    def value(self, text: str, color=None, scale: float = 0.55) -> None:
+        if self.drawing:
+            _put(self.frame, text, (self.x, self.y), scale, color or C_TEXT)
+        self.y += int(20 * scale / 0.55)
+
+    def note(self, text: str, color=None) -> None:
+        if self.drawing:
+            _put(self.frame, text, (self.x, self.y), 0.32, color or C_DIM)
+        self.y += 13
+
+    def rule(self) -> None:
+        self.y += 4
+        if self.drawing:
+            cv2.line(self.frame, (self.x, self.y), (self.x + self.width, self.y), C_LINE, 1)
+        self.y += 14
+
+    def chips(self, items: list[tuple[str, str, tuple]], per_row: int = 2) -> None:
+        """Compact state pills, two per row."""
+        cw = (self.width - 8) // per_row
+        for i, (label, value, color) in enumerate(items):
+            col = i % per_row
+            if col == 0 and i:
+                self.y += 34
+            if self.drawing:
+                cx = self.x + col * (cw + 8)
+                _put(self.frame, label.upper(), (cx, self.y), 0.29, C_DIM)
+                _put(self.frame, value[:12], (cx, self.y + 15), 0.4, color)
+        self.y += 34
+
+
+def _panel_background(frame, x, y, w, h, alpha=0.9):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), C_BG, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), C_LINE, 1)
+
+
+def draw_skeleton(frame, landmarks, min_vis=0.4, color=C_ACCENT):
+    """Single thin skeleton. Both the pose backend and the UI used to draw one."""
     if not landmarks:
         return
     h, w = frame.shape[:2]
-    pts = []
-    for lm in landmarks:
-        if lm.visibility >= min_vis:
-            pts.append((int(lm.x * w), int(lm.y * h)))
-        else:
-            pts.append(None)
+    pts = {}
+    for i, lm in enumerate(landmarks):
+        if float(getattr(lm, "visibility", 0.0) or 0.0) < min_vis:
+            continue
+        px, py = int(lm.x * w), int(lm.y * h)
+        if 0 <= px < w and 0 <= py < h:
+            pts[i] = (px, py)
 
     for a, b in _POSE_CONNECTIONS:
-        if a < len(pts) and b < len(pts) and pts[a] and pts[b]:
+        if a in pts and b in pts:
             cv2.line(frame, pts[a], pts[b], color, 1, cv2.LINE_AA)
-
-    for p in pts:
-        if p:
-            cv2.circle(frame, p, 3, color, -1, cv2.LINE_AA)
-def fill_alpha(frame, x1, y1, x2, y2, color, alpha=0.85):
-    ov = frame.copy()
-    cv2.rectangle(ov, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(ov, alpha, frame, 1 - alpha, 0, frame)
+    for p in pts.values():
+        cv2.circle(frame, p, 2, color, -1, cv2.LINE_AA)
 
 
-def border(frame, x1, y1, x2, y2, color, t=1):
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, t)
+def _respiration_text(snap: MonitorSnapshot) -> tuple[str, tuple, str]:
+    state = snap.respiration_state
+    if state == resp.BREATHING:
+        return f"{snap.respiration_bpm:.0f} BPM", C_OK, ""
+    if state == resp.NO_BREATHING:
+        return "NOT DETECTED", C_CRIT, ""
+    if state == resp.UNVERIFIED:
+        return "UNVERIFIED", C_WARN, snap.respiration_reason
+    if state == resp.READING:
+        return "MEASURING", C_DIM, ""
+    return "—", C_DIM, ""
 
 
-def lbl(frame, txt, x, y, col=None, sc=0.40, tk=1):
-    cv2.putText(frame, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col or C_TEXT_SEC, tk, cv2.LINE_AA)
+def _movement_text(snap: MonitorSnapshot) -> tuple[str, tuple]:
+    """
+    Describes movement only. The reason it matters belongs to the verdict —
+    printing NO RESPIRATION here as well just said the same thing twice.
+    """
+    state = snap.stillness_state
+    color = {
+        still.NO_RESPIRATION: C_CRIT,
+        still.PROLONGED_STILL: C_WARN,
+        still.ASLEEP: C_OK,
+        still.READING: C_DIM,
+    }.get(state, C_OK)
+    text = {
+        still.READING: "measuring",
+        still.ACTIVE: "MOVING",
+        still.STILL: "STILL",
+        still.ASLEEP: "ASLEEP",
+        still.PROLONGED_STILL: "STILL",
+        still.NO_RESPIRATION: "STILL",
+    }.get(state, state)
+    if snap.stillness_sec >= 1 and state != still.READING:
+        return f"{text}   {format_duration(snap.stillness_sec)}", color
+    return text, color
 
 
-def val(frame, txt, x, y, col=None, sc=0.60, tk=2):
-    cv2.putText(frame, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col or C_TEXT_PRI, tk, cv2.LINE_AA)
+def recent_alerts(alerts: list, limit: int = 2) -> list:
+    """Newest first. AlertManager.get_log() is in append order, so oldest first."""
+    return list(reversed(alerts))[:limit]
 
 
-def pill_bar(frame, x, y, w, h, v, mx, col):
-    pct = min(v / max(mx, 0.0001), 1.0)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), C_BORDER, -1)
-    fw = int(w * pct)
-    if fw > 0:
-        cv2.rectangle(frame, (x, y), (x + fw, y + h), col, -1)
+def _expression_lines(snap: MonitorSnapshot) -> tuple[str, tuple, str]:
+    """Label and number always describe the same prediction, or say so."""
+    if snap.pain_state == pain_states.LOADING:
+        return "loading model", C_DIM, ""
+    if snap.pain_state == pain_states.NOT_ASSESSED:
+        return "NOT ASSESSED", C_DIM, "no clear view of the face"
+    if snap.emotion == pain_states.UNCERTAIN:
+        return "UNCERTAIN", C_DIM, "model confidence below threshold"
+
+    color = _severity_color(snap.pain_state) if snap.pain_state != "NORMAL" else C_OK
+    text = f"{snap.emotion.upper()}  {snap.pain_score:.0%}"
+    if snap.expression_mode == "cv_fallback":
+        return text, C_WARN, "heuristic fallback — cannot escalate"
+    return text, color, ""
 
 
-def badge(frame, x, y, w, h, txt, col):
-    fill_alpha(frame, x, y, x + w, y + h, col, alpha=0.20)
-    border(frame, x, y, x + w, y + h, col, 1)
-    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-    cv2.putText(frame, txt, (x + (w - tw) // 2, y + (h + th) // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
-
-
-def render(frame, agi_v, agi_st, posture, still_dur, still_st,
-           boundary_st, cx, cy, state, msg, face_vis,
-           fallen, fall_ratio, emotion, pain_score, pain_state,
-           alert_log, cfg: Thresholds, landmarks=None, pose_backend: str = "auto"):
-
+def render(frame, snap: MonitorSnapshot, cfg: Thresholds):
+    """Draw the overlay onto `frame` in place."""
     h, w = frame.shape[:2]
-    sc = C_OK if state == "NORMAL" else C_WARN if state == "WARNING" else C_CRIT
-    draw_skeleton(frame, landmarks)
+    accent = _severity_color(snap.state)
 
-    PX, PY, PW = 10, 10, 270
-    PH = h - 20
-    fill_alpha(frame, PX, PY, PX + PW, PY + PH, C_PANEL, 0.88)
-    border(frame, PX, PY, PX + PW, PY + PH, C_BORDER)
+    draw_skeleton(frame, snap.landmarks)
+    _draw_scene(frame, snap, cfg, accent)
 
-    fill_alpha(frame, PX, PY, PX + PW, PY + 44, sc, 0.15)
-    border(frame, PX, PY, PX + PW, PY + 44, sc)
-    cv2.circle(frame, (PX + 18, PY + 22), 6, sc, -1, cv2.LINE_AA)
-    cv2.putText(frame, state, (PX + 30, PY + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, sc, 2, cv2.LINE_AA)
-    lbl(frame, msg[:32], PX + 10, PY + 42, sc, 0.33)
+    # Measure first so the panel is as tall as its contents. A sidebar
+    # stretched to the window height is mostly empty space, and empty space
+    # reads as missing information.
+    measured = _Column(None, PAD + 14, PAD + 30, PANEL_W - 28)
+    _fill_panel(measured, snap, accent)
+    content_h = measured.y - PAD + 46  # footer block
+    panel_h = max(150, min(content_h, h - 2 * PAD))
 
-    sy = PY + 58
-    lbl(frame, "FALL STATUS", PX + 10, sy)
-    fc = C_CRIT if fallen else C_OK
-    val(frame, "FALL DETECTED!" if fallen else "SAFE", PX + 10, sy + 18, fc, 0.52, 2)
-    lbl(frame, f"ratio {fall_ratio:.3f}", PX + 10, sy + 36, C_TEXT_SEC, 0.34)
+    _panel_background(frame, PAD, PAD, PANEL_W, panel_h)
+    _fill_panel(_Column(frame, PAD + 14, PAD + 30, PANEL_W - 28), snap, accent)
+    _draw_footer(frame, snap, panel_h)
 
-    sy = PY + 110
-    lbl(frame, "AGITATION", PX + 10, sy)
-    ac = C_CRIT if agi_st == "HIGH" else C_WARN if agi_st == "MILD" else C_OK
-    pill_bar(frame, PX + 10, sy + 6, PW - 20, 5, agi_v, cfg.agitation_high, ac)
-    badge(frame, PX + 10, sy + 18, 80, 20, agi_st, ac)
 
-    sy = PY + 158
-    lbl(frame, "POSTURE", PX + 10, sy)
-    pc = (C_WARN if posture in ["SITTING UP", "ROLLING", "CALIBRATING"]
-          else C_TEXT_SEC if posture == "READING" else C_OK)
-    val(frame, posture, PX + 10, sy + 18, pc, 0.52, 2)
+def _fill_panel(col: _Column, snap: MonitorSnapshot, accent):
+    frame = col.frame
 
-    sy = PY + 208
-    lbl(frame, "MOVEMENT", PX + 10, sy)
-    mc = (C_CRIT if still_st == "UNCONSCIOUS" else
-          C_WARN if still_st in ["VERY STILL", "STILL"] else
-          C_TEXT_SEC if still_st == "READING" else C_OK)
-    if still_dur > 0:
-        pill_bar(frame, PX + 10, sy + 6, PW - 20, 5, still_dur, cfg.unconscious_sec, mc)
-        val(frame, still_st, PX + 10, sy + 24, mc, 0.46, 1)
-        lbl(frame, f"{still_dur:.0f}s / {cfg.unconscious_sec:.0f}s", PX + 10, sy + 40, mc)
-    else:
-        val(frame, still_st, PX + 10, sy + 18, mc, 0.50, 1)
+    # Verdict
+    if col.drawing:
+        cv2.circle(frame, (col.x + 5, col.y - 5), 5, accent, -1, cv2.LINE_AA)
+        _put(frame, snap.state, (col.x + 18, col.y), 0.62, accent)
+    col.y += 18
+    col.note(snap.message[:34], C_TEXT)
+    col.rule()
 
-    sy = PY + 272
-    lbl(frame, "PAIN SIGNAL", PX + 10, sy)
-    pnc = C_CRIT if pain_state == "CRITICAL" else C_WARN if pain_state == "WARNING" else C_OK
-    pill_bar(frame, PX + 10, sy + 6, PW - 20, 5, pain_score, 1.0, pnc)
-    pain_label = "OFFLINE" if pain_state == "OFFLINE" else f"{emotion.upper()}  {pain_score:.0%}"
-    lbl(frame, pain_label, PX + 10, sy + 22, pnc, 0.38)
+    # Vitals
+    col.label("respiration")
+    value, color, reason = _respiration_text(snap)
+    col.value(value, color)
+    if reason:
+        col.note(reason[:36])
+    col.gap(8)
 
-    sy = PY + 316
-    lbl(frame, "BED POSITION", PX + 10, sy)
-    bc = C_CRIT if boundary_st != "CENTER" else C_OK
-    badge(frame, PX + 10, sy + 8, 120, 22, boundary_st, bc)
+    col.label("movement")
+    movement, mcolor = _movement_text(snap)
+    col.value(movement, mcolor, scale=0.46)
+    col.rule()
 
-    sy = PY + 360
-    lbl(frame, "POSE / FACE", PX + 10, sy)
-    mode = f"{pose_backend.upper()}" + (" +FACE" if face_vis else "")
-    val(frame, mode[:22], PX + 10, sy + 16,
-        C_OK if face_vis else C_WARN, 0.42, 1)
+    # States that matter but do not need a number
+    col.chips([
+        ("posture", snap.posture, C_WARN if snap.posture in ("SITTING UP", "ROLLING") else C_TEXT),
+        ("agitation", snap.agitation_state,
+         C_CRIT if snap.agitation_state == "HIGH"
+         else C_WARN if snap.agitation_state == "MILD" else C_TEXT),
+        ("position", snap.boundary_state, C_CRIT if snap.boundary_state != "CENTER" else C_TEXT),
+    ])
+    col.rule()
 
-    cv2.line(frame, (PX + 10, PY + 392), (PX + PW - 10, PY + 392), C_BORDER, 1)
+    col.label("expression")
+    etext, ecolor, enote = _expression_lines(snap)
+    col.value(etext, ecolor, scale=0.44)
+    if enote:
+        col.note(enote[:38])
 
-    sy = PY + 402
-    lbl(frame, "RECENT ALERTS", PX + 10, sy)
-    for i, e in enumerate(list(reversed(alert_log[-4:]))):
-        ey = sy + 14 + i * 36
-        if ey + 30 > PY + PH - 8:
-            break
-        ec = C_CRIT if e["severity"] == "CRITICAL" else C_WARN
-        fill_alpha(frame, PX + 10, ey, PX + PW - 10, ey + 28, ec, 0.08)
-        border(frame, PX + 10, ey, PX + PW - 10, ey + 28, ec, 1)
-        cv2.circle(frame, (PX + 20, ey + 9), 3, ec, -1, cv2.LINE_AA)
-        lbl(frame, e["time"], PX + 28, ey + 12, C_TEXT_SEC, 0.34)
-        lbl(frame, e["event"][:26], PX + 14, ey + 24, ec, 0.35)
+    if snap.alerts:
+        col.rule()
+        col.label("last alerts")
+        for entry in recent_alerts(snap.alerts):
+            color = _severity_color(entry.get("severity", ""))
+            col.note(f"{entry.get('time', '')}  {str(entry.get('event', ''))[:22]}", color)
 
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    fill_alpha(frame, w - 190, 10, w - 10, 60, C_PANEL, 0.88)
-    border(frame, w - 190, 10, w - 10, 60, C_BORDER)
-    lbl(frame, "MEDISENSE  v5.2", w - 183, 28, C_ACCENT, 0.38)
-    val(frame, ts, w - 183, 52, C_TEXT_PRI, 0.52, 1)
 
-    if state != "NORMAL":
-        bx1, by1, bx2, by2 = PX + PW + 8, h - 58, w - 10, h - 10
-        fill_alpha(frame, bx1, by1, bx2, by2, sc, 0.12)
-        border(frame, bx1, by1, bx2, by2, sc)
-        cv2.rectangle(frame, (bx1, by1), (bx1 + 5, by2), sc, -1)
-        lbl(frame, "NURSE ALERT", bx1 + 14, by1 + 18, sc, 0.42)
-        val(frame, msg, bx1 + 14, by1 + 40, C_TEXT_PRI, 0.52, 1)
+def _draw_footer(frame, snap: MonitorSnapshot, panel_h: int):
+    y = PAD + panel_h - 14
+    bits = [snap.pose_backend.upper(), snap.source_label]
+    if snap.low_light:
+        bits.append("night vision")
+    _put(frame, " | ".join(bits)[:34], (PAD + 14, y - 15), 0.3, C_DIM)
+    _put(frame, datetime.datetime.now().strftime("%H:%M:%S"), (PAD + 14, y), 0.42, C_TEXT)
 
-    if fallen:
-        ov = frame.copy()
-        cv2.rectangle(ov, (0, h // 2 - 45), (w, h // 2 + 45), (0, 0, 160), -1)
-        cv2.addWeighted(ov, 0.6, frame, 0.4, 0, frame)
-        cv2.putText(frame, "FALL DETECTED — ALERTING RELATIVE", (w // 2 - 260, h // 2 + 12),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2)
 
+def _draw_scene(frame, snap: MonitorSnapshot, cfg: Thresholds, accent):
+    """Bed guides, patient marker, face box and the alert strip."""
+    h, w = frame.shape[:2]
+    scene_x = PAD + PANEL_W + 10
+
+    # Bed edges: thin, dim, labelled once.
     lx = int(w * cfg.bed_margin)
     rx = int(w * (1.0 - cfg.bed_margin))
-    for yp in range(0, h, 12):
-        cv2.line(frame, (lx, yp), (lx, min(yp + 7, h)), C_BED_LINE, 1)
-        cv2.line(frame, (rx, yp), (rx, min(yp + 7, h)), C_BED_LINE, 1)
-    lbl(frame, "BED EDGE", lx + 4, 22, C_BED_LINE, 0.36)
-    lbl(frame, "BED EDGE", rx + 4, 22, C_BED_LINE, 0.36)
+    for x in (lx, rx):
+        if x > scene_x:
+            cv2.line(frame, (x, PAD), (x, h - PAD), C_LINE, 1, cv2.LINE_AA)
+    if rx > scene_x:
+        _put(frame, "BED EDGE", (rx - 64, h - PAD - 8), 0.3, C_DIM)
 
-    if 0.01 < cx < 0.99 and 0.01 < cy < 0.99:
-        px, py_ = int(cx * w), int(cy * h)
-        bc2 = C_CRIT if boundary_st != "CENTER" else C_ACCENT
-        cv2.circle(frame, (px, py_), 9, bc2, 1, cv2.LINE_AA)
-        cv2.circle(frame, (px, py_), 2, bc2, -1, cv2.LINE_AA)
-        cv2.line(frame, (px - 14, py_), (px - 9, py_), bc2, 1)
-        cv2.line(frame, (px + 9, py_), (px + 14, py_), bc2, 1)
-        cv2.line(frame, (px, py_ - 14), (px, py_ - 9), bc2, 1)
-        cv2.line(frame, (px, py_ + 9), (px, py_ + 14), bc2, 1)
+    if snap.person_bbox is not None:
+        x1, y1, x2, y2 = snap.person_bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), C_LINE, 1, cv2.LINE_AA)
+
+    if snap.face_box is not None:
+        fx, fy, fw, fh = snap.face_box
+        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), C_ACCENT, 1, cv2.LINE_AA)
+
+    if 0.01 < snap.patient_cx < 0.99 and 0.01 < snap.patient_cy < 0.99:
+        px, py = int(snap.patient_cx * w), int(snap.patient_cy * h)
+        marker = C_CRIT if snap.boundary_state != "CENTER" else C_ACCENT
+        cv2.circle(frame, (px, py), 7, marker, 1, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), 1, marker, -1, cv2.LINE_AA)
+
+    # A single strip, top of the video area — unmissable without covering the
+    # patient the way the old full-width centre banner did.
+    if snap.state != "NORMAL":
+        y0 = PAD
+        y1 = PAD + 30
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (scene_x, y0), (w - PAD, y1), accent, -1)
+        cv2.addWeighted(overlay, 0.16, frame, 0.84, 0, frame)
+        cv2.rectangle(frame, (scene_x, y0), (w - PAD, y1), accent, 1)
+        cv2.rectangle(frame, (scene_x, y0), (scene_x + 4, y1), accent, -1)
+        _put(frame, snap.message[:44], (scene_x + 14, y0 + 20), 0.5, C_TEXT)

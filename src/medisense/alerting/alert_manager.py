@@ -11,6 +11,16 @@ Every event goes through a 3-stage confirmation before it actually fires
 brief 1-2 second blip never triggers a real alert. A cooldown then prevents
 the same event from re-firing too often once it has.
 
+Confirmation decays rather than resetting. A single frame in which a detector
+loses the patient used to delete the pending event outright and restart the
+clock from zero, so an event that was real but intermittently occluded could
+never accumulate enough consecutive time to fire. Time already served is now
+credited back gradually, which keeps brief blips harmless without discarding
+progress on a flickering-but-genuine condition.
+
+Stage timing is measured with an injected clock so replaying a recorded file
+confirms alerts over the same number of *video* seconds as a live feed.
+
 Credentials are read from `medisense.config.secrets`, which loads them
 from environment variables — never hardcoded here.
 """
@@ -29,6 +39,7 @@ import logging
 
 import requests
 
+from medisense.clock import WallClock
 from medisense.config import Thresholds, secrets
 from medisense.reporting.db import EventLogger
 
@@ -72,14 +83,16 @@ class AlertManager:
         alert.resolve("FALL DETECTED")
     """
 
-    def __init__(self, cfg: Thresholds):
+    def __init__(self, cfg: Thresholds, clock=None):
         self.cfg = cfg
+        self.clock = clock or WallClock()
         self._active = {}
         self._alerted = {}
         self._lock = threading.Lock()
         self._log = []
         self._stop = threading.Event()
         self._event_db = EventLogger()
+        self._context = {"pose_backend": "unknown", "distress_score": 0.0, "expression_mode": "unknown"}
 
         missing = secrets.missing()
         if missing:
@@ -99,22 +112,61 @@ class AlertManager:
 
     def trigger(self, severity: str, event: str, detail: str):
         """Call every frame a problem is currently detected."""
-        now = time.time()
+        now = self.clock.now()
         with self._lock:
-            if event not in self._active:
+            info = self._active.get(event)
+            if info is None:
                 self._active[event] = {
-                    "since": now, "severity": severity, "detail": detail, "stage": 0,
+                    "since": now, "severity": severity, "detail": detail,
+                    "stage": 0, "last_seen": now,
                 }
                 logger.info("Watching: %s (%s)", event, severity)
+                return
+            # Keep the description current without restarting the clock, so
+            # the fired alert reports the situation as it stands.
+            info["severity"] = severity
+            info["detail"] = detail
+            info["last_seen"] = now
 
     def resolve(self, event: str):
-        """Call when the situation returns to normal."""
+        """
+        Call when the situation returns to normal.
+
+        Credits confirmation time back gradually instead of deleting the
+        pending event, so a one-frame detector dropout does not restart an
+        8-second confirmation from zero.
+        """
+        now = self.clock.now()
         with self._lock:
-            self._active.pop(event, None)
+            info = self._active.get(event)
+            if info is None:
+                return
+            gap = max(0.0, now - info["last_seen"])
+            info["last_seen"] = now
+            info["since"] = min(now, info["since"] + gap * self.cfg.alert_decay_factor)
+            if now - info["since"] <= 0.0:
+                self._active.pop(event, None)
 
     def resolve_all(self):
         with self._lock:
             self._active.clear()
+
+    def set_context(self, pose_backend=None, distress_score=None, expression_mode=None):
+        """
+        Record which pipeline produced the current readings.
+
+        Logged with every event so the audit trail says whether a score came
+        from the neural model or the heuristic fallback, and which pose
+        backend was active. Without it the stored distress score is a
+        constant zero and the shift report averages nothing.
+        """
+        with self._lock:
+            if pose_backend is not None:
+                self._context["pose_backend"] = pose_backend
+            if distress_score is not None:
+                self._context["distress_score"] = float(distress_score)
+            if expression_mode is not None:
+                self._context["expression_mode"] = expression_mode
 
     def get_log(self) -> list:
         with self._lock:
@@ -126,40 +178,53 @@ class AlertManager:
 
     # ── 3-stage confirmation ────────────────────
 
+    def tick(self):
+        """
+        Advance stage confirmation.
+
+        Called once per frame by the main loop, which is what makes stages
+        progress correctly when a video clock runs faster or slower than wall
+        time. The background thread calls the same logic so confirmation also
+        advances while a live feed is stalled between frames.
+        """
+        self._evaluate(self.clock.now())
+
     def _monitor_loop(self):
         while not self._stop.is_set():
             time.sleep(0.5)
-            now = time.time()
-            with self._lock:
-                events = [
-                    (event, dict(info)) for event, info in self._active.items()
-                ]
+            self._evaluate(self.clock.now())
 
-            for event, info in events:
-                duration = now - info["since"]
+    def _evaluate(self, now: float):
+        with self._lock:
+            events = [(event, dict(info)) for event, info in self._active.items()]
 
-                if duration >= self.cfg.stage1_sec and info["stage"] == 0:
-                    with self._lock:
-                        if event in self._active and self._active[event]["stage"] == 0:
-                            self._active[event]["stage"] = 1
-                    logger.info("Stage 1: %s (%.1fs)", event, duration)
+        for event, info in events:
+            duration = now - info["since"]
 
-                elif duration >= self.cfg.stage2_sec and info["stage"] == 1:
-                    with self._lock:
-                        last = self._alerted.get(event, 0)
-                        if now - last < self.cfg.alert_cooldown_sec:
-                            continue
-                        if event not in self._active or self._active[event]["stage"] != 1:
-                            continue
-                        self._active[event]["stage"] = 2
-                        self._alerted[event] = now
-                        detail = self._active[event]["detail"]
-                        severity = self._active[event]["severity"]
-                    threading.Thread(
-                        target=self._fire_alert,
-                        args=(severity, event, detail, duration),
-                        daemon=True,
-                    ).start()
+            if duration >= self.cfg.stage1_sec and info["stage"] == 0:
+                with self._lock:
+                    if event in self._active and self._active[event]["stage"] == 0:
+                        self._active[event]["stage"] = 1
+                    else:
+                        continue
+                logger.info("Stage 1: %s (%.1fs)", event, duration)
+
+            elif duration >= self.cfg.stage2_sec and info["stage"] == 1:
+                with self._lock:
+                    last = self._alerted.get(event, 0)
+                    if now - last < self.cfg.alert_cooldown_sec:
+                        continue
+                    if event not in self._active or self._active[event]["stage"] != 1:
+                        continue
+                    self._active[event]["stage"] = 2
+                    self._alerted[event] = now
+                    detail = self._active[event]["detail"]
+                    severity = self._active[event]["severity"]
+                threading.Thread(
+                    target=self._fire_alert,
+                    args=(severity, event, detail, duration),
+                    daemon=True,
+                ).start()
 
     # ── Fire ─────────────────────────────────────
 
@@ -171,6 +236,7 @@ class AlertManager:
         )
 
         with self._lock:
+            context = dict(self._context)
             self._log.append({
                 "time": ts, "event": event, "detail": detail,
                 "severity": severity, "duration": duration,
@@ -180,6 +246,9 @@ class AlertManager:
                 severity=severity,
                 detail=detail,
                 duration_sec=duration,
+                pose_backend=context["pose_backend"],
+                distress_score=context["distress_score"],
+                expression_mode=context["expression_mode"],
             )
 
         t1 = threading.Thread(target=self._play_alarm, daemon=True)

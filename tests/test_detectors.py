@@ -1,9 +1,10 @@
+from medisense.detectors import stillness as still
 from medisense.detectors.agitation import AgitationDetector
 from medisense.detectors.stillness import StillnessDetector
 from medisense.detectors.posture import PostureDetector
 from medisense.state import get_overall_state
 from medisense.vision.landmarks import Landmark, landmarks_from_coco, snapshot_landmarks
-from conftest import lying_patient, make_landmarks
+from conftest import lying_patient
 
 
 def test_snapshot_landmarks_breaks_aliasing():
@@ -63,9 +64,33 @@ def test_posture_sitting_up_after_calibration(cfg):
 
 
 def test_overall_state_priority():
-    state, msg = get_overall_state(True, "HIGH", "SITTING UP", "UNCONSCIOUS", "LEFT EDGE", "CRITICAL")
+    state, msg = get_overall_state(
+        True, "HIGH", "SITTING UP", still.NO_RESPIRATION, "LEFT EDGE", "CRITICAL"
+    )
     assert state == "CRITICAL"
     assert "FALL" in msg
 
-    state, msg = get_overall_state(False, "CALM", "LYING", "ACTIVE", "CENTER", "NORMAL")
+    state, msg = get_overall_state(False, "CALM", "LYING", still.ACTIVE, "CENTER", "NORMAL")
     assert state == "NORMAL"
+
+
+def test_absent_respiration_outranks_everything_but_a_fall():
+    state, msg = get_overall_state(
+        False, "HIGH", "SITTING UP", still.NO_RESPIRATION, "LEFT EDGE", "CRITICAL"
+    )
+    assert state == "CRITICAL"
+    assert "RESPIRATION" in msg
+
+
+def test_sleeping_patient_is_a_normal_state():
+    state, msg = get_overall_state(False, "CALM", "LYING", still.ASLEEP, "CENTER", "NORMAL")
+    assert state == "NORMAL"
+    assert "sleep" in msg.lower()
+
+
+def test_unverifiable_respiration_is_a_warning_not_a_critical():
+    state, msg = get_overall_state(
+        False, "CALM", "LYING", still.PROLONGED_STILL, "CENTER", "NORMAL"
+    )
+    assert state == "WARNING"
+    assert "UNVERIFIED" in msg

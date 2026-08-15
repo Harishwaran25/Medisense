@@ -1,7 +1,9 @@
 ================================================================================
-MEDISENSE v5.2 — PROJECT HANDOFF / TRANSFER NOTES
+MEDISENSE — PROJECT HANDOFF / TRANSFER NOTES
 ================================================================================
-Date prepared: 22 July 2026
+Sections 1-8 were written for v5.2 (22 July 2026).
+Sections 9 (v5.3) and 10 (v5.4) supersede them where they disagree — read those
+first if you are looking at current behaviour.
 Project folder: medisense_v5_restructured
 
 Copy this WHOLE folder to the other laptop (zip or USB).
@@ -254,20 +256,168 @@ medisense_v5_restructured/
 
 
 ================================================================================
+9) v5.3 — CHANGES SINCE THE NOTES ABOVE
+================================================================================
+
+Sections 1-8 describe v5.2. The following changed in v5.3; where they conflict,
+this section is current.
+
+--- A) Sleep is no longer treated as unconsciousness (most important) ---
+v5.2 fired CRITICAL "UNCONSCIOUS" after 20 seconds of stillness. A sleeping
+patient is motionless for hours, so overnight monitoring produced a critical
+alert every cooldown period all night. Any alarm that cries wolf that reliably
+gets muted, and a muted monitor detects nothing.
+
+  NEW: src/medisense/detectors/breathing.py
+    Respiration estimate from chest-region intensity oscillation. Stillness now
+    reports only how long the patient has been still; escalation is gated on
+    respiration:
+      still + breathing detected        -> ASLEEP           (normal)
+      still + no breathing detected     -> NO RESPIRATION   (critical)
+      still + respiration unmeasurable  -> PROLONGED STILL  (warning, delayed)
+
+    Occluded chest, a dark room, or a frozen stream report UNVERIFIED rather
+    than absent breathing. "Cannot measure" and "not breathing" must never
+    collapse into the same answer when only one of them alarms.
+
+  Event name changed: "UNCONSCIOUS" -> "NO RESPIRATION".
+
+--- B) Video file / RTSP input, and a video clock ---
+  MEDISENSE_CAM_SOURCE now accepts a webcam index, a file path, or a stream URL
+  (was integer-only, which made offline validation impossible).
+  MEDISENSE_LOOP_VIDEO=1 restarts a file when it ends.
+
+  Files replay against a clock built from the container's own timestamps, so
+  second-based thresholds mean the same thing during replay as they do live.
+  Without that, twenty seconds of footage elapsing in two seconds of wall time
+  silently changes every duration threshold.
+
+--- C) Expression channel labelled by provenance ---
+  The OpenCV contrast/edge fallback is capped at WARNING and can no longer
+  raise a critical alert; contrast and edge density have no established
+  relationship to pain. The active mode (neural / cv_fallback) is shown in the
+  UI and stored with every logged event.
+
+--- D) Fall baseline is maintained, not frozen ---
+  A calibration window the patient moved through is rejected and retried
+  instead of averaged. The accepted baseline absorbs a new resting position
+  once the patient is parked, but not while they are still moving, so a slow
+  slide off the bed is no longer chased by the baseline meant to measure it.
+  Press R in the GUI to re-arm after moving the bed or camera.
+
+--- E) Alert confirmation decays instead of resetting ---
+  A single frame of lost pose used to delete the pending event and restart the
+  8-second confirmation from zero, so an intermittently occluded but genuine
+  event could never fire. Time served is now credited back gradually.
+
+--- F) Bugs fixed ---
+  - A debug log line ran at INFO on every frame, to file and stdout.
+  - Every frame was darkened 18% unconditionally before night-vision ran,
+    which also biased the low-light detection threshold.
+  - distress_score and pose_backend were never passed to the event logger, so
+    the shift report's "Average Patient Distress Score" was always 0.0.
+  - The shift report searched for event types "FALLEN" / "AGITATION" /
+    "STILLNESS" while the alert manager wrote "FALL DETECTED" / "HIGH
+    AGITATION" / "UNCONSCIOUS", so its recommendations section could never
+    trigger. Event names are now shared constants in config.py.
+  - cv2.data was accessed unguarded, crashing on OpenCV builds that do not
+    provide it (most distro packages). Cascade lookup now falls back to the
+    usual install roots and degrades to landmark-derived crops if missing.
+  - render.py imported MediaPipe at module scope purely for its skeleton edge
+    list, so a YOLO-only install could not start the app at all.
+
+--- G) New ---
+  - `medisense-report [hours] [db_path]` console command for the shift handover
+    report (previously only reachable as a module).
+  - Tests: 85 total, including an end-to-end run of the main loop against a
+    generated video clip. `pytest tests/` now works from a clone without
+    setting PYTHONPATH.
+
+--- H) Still true, and worth repeating ---
+  Not a certified medical device. Camera-based respiration depends on lighting,
+  bedding, camera angle and distance and is unvalidated here; there is no
+  apnoea-detection claim. Thresholds remain hand-tuned. See docs/VALIDATION.md
+  for how to measure them now that file replay exists.
+
+
+================================================================================
+10) v5.4 — EXPRESSION ACCURACY AND THE OVERLAY
+================================================================================
+
+Reported from a live run: the emotion reading was wrong and the panel was too
+cluttered to read. Both had specific causes.
+
+--- A) The expression model was being fed things that were not faces ---
+  When the Haar cascades missed (common for a side-lying patient) the face
+  finder returned a square guessed around the nose landmark, and the caller
+  passed it to the classifier anyway. A classifier returns a confident-looking
+  label for any image, so pillows, ears and bedding were being scored as
+  emotions. Four gates now apply:
+
+    - Only true cascade detections are scored. FaceFind.source distinguishes
+      frontal / profile / landmark, and .is_detection is the gate. Landmark
+      crops are still used for face-position tracking, never for expression.
+    - Crops are rotated upright from eye or ear landmarks before inference.
+      Expression models are trained on upright faces; a bedridden patient's
+      face arrives rotated by up to ninety degrees.
+    - Crops below MEDISENSE_EMOTION_MIN_FACE_PX (64) or below the focus
+      threshold MEDISENSE_EMOTION_MIN_SHARPNESS (variance of Laplacian) are
+      rejected rather than scored.
+    - A prediction whose own top-1 confidence is under
+      MEDISENSE_EMOTION_MIN_CONFIDENCE (0.45) reports UNCERTAIN, not a label.
+
+  Displayed label and displayed number now describe the same prediction. The
+  label was the argmax emotion while the number was a weighted sum over all
+  seven, so the panel could read "NEUTRAL 61%" — two true statements that look
+  like a broken detector.
+
+  After MEDISENSE_PAIN_STALE_SEC (10) without a readable face the panel reads
+  NOT ASSESSED instead of holding a stale NORMAL. An unreadable face must not
+  look like a calm one.
+
+--- B) Two skeletons were drawn on every frame ---
+  PoseEstimator.draw() drew a skeleton and bbox, then render() drew another one
+  in a different colour on top. PoseEstimator.draw() has been removed; all
+  drawing lives in medisense.ui.render.
+
+--- C) Overlay rebuilt ---
+  Removed: the raw `ratio 0.123` fall diagnostic, both progress bars, the
+  four-entry alert history, the full-width red banner across the middle of the
+  video, the duplicated timestamp box, and the movement row that repeated the
+  verdict it sat below.
+
+  Kept: verdict, respiration, time-still, and three state chips. The panel is
+  sized to its contents instead of stretched down the window, and alerts appear
+  only when there are any. Critical state is a strip along the top of the video
+  area, which does not cover the patient.
+
+  render() now takes a single MonitorSnapshot (src/medisense/ui/model.py)
+  instead of twenty-odd positional arguments.
+
+  Hershey fonts are ASCII-only and drew every em-dash and middle dot in the
+  state messages as "???". Overlay text is sanitised at draw time.
+
+--- D) Weights path fixed ---
+  yolo_pose_model defaulted to an absolute path inside the installed package
+  (an empty directory), disagreeing with the documented value and unwritable on
+  a system-wide install. It now prefers src/medisense/models/yolov8n-pose.pt if
+  that file exists and otherwise uses the bare asset name so Ultralytics
+  downloads it into the working directory.
+
+--- E) Tests: 108 total ---
+  New tests/test_render.py (the overlay had none, which is how the double
+  skeleton survived), expression gate tests in tests/test_pain.py, face
+  provenance and roll-correction tests in tests/test_vision_prod.py, and an
+  integration test that runs the real render path with windowing stubbed —
+  previously the snapshot wiring was never executed by any test.
+
+--- F) Still true, and worth repeating ---
+  Not a certified medical device. Camera-based respiration depends on lighting,
+  bedding, camera angle and distance and is unvalidated here; there is no
+  apnoea-detection claim. Thresholds remain hand-tuned. See docs/VALIDATION.md
+  for how to measure them now that file replay exists.
+
+
+================================================================================
 END OF HANDOFF
 ================================================================================
-Created PROJECT_HANDOFF.txt in the project root. It covers:
-
-What you asked (all requests in this chat)
-What was changed (v5.2 improvements, YOLO/CV, hardening)
-How to install and run on the other laptop
-What to copy / skip, troubleshooting, demo checklist
-Transfer tip: zip the whole medisense_v5_restructured folder, but skip .venv, .env, __pycache__, and any .pt files. On the new laptop:
-
-cd medisense_v5_restructured
-python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
-pip install -U pip setuptools wheel
-pip install -e ".[dev]"
-cp .env.example .env
-python -m medisense
-Needs Python 3.10+, a webcam, and internet on first run (YOLO weights). Full details are in PROJECT_HANDOFF.txt.

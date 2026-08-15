@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medisense"
-version = "5.2.0"
+version = "5.4.0"
 description = "Computer-vision based bedridden patient safety monitor (portfolio project)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ dev = ["pytest==8.3.2"]
 
 [project.scripts]
 medisense = "medisense.app:main"
+medisense-report = "medisense.reporting.llm_summary:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

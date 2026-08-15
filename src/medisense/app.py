@@ -12,11 +12,25 @@ import signal
 import sys
 
 import cv2
-import numpy as np
 
-from medisense.config import Thresholds, setup_logging
+from medisense.config import (
+    EVENT_AGITATION,
+    EVENT_BOUNDARY,
+    EVENT_CAMERA_OFFLINE,
+    EVENT_FALL,
+    EVENT_NO_RESPIRATION,
+    EVENT_PAIN,
+    EVENT_POSE_LOST,
+    EVENT_POSTURE,
+    EVENT_STILLNESS_UNVERIFIED,
+    PATIENT_EVENTS,
+    Thresholds,
+    setup_logging,
+)
 from medisense.health import run_healthcheck
 from medisense.alerting.alert_manager import AlertManager
+from medisense.detectors import stillness as still_states
+from medisense.detectors.breathing import BreathingDetector
 from medisense.detectors.fall import FallDetector
 from medisense.detectors.agitation import AgitationDetector
 from medisense.detectors.posture import PostureDetector
@@ -25,7 +39,9 @@ from medisense.detectors.boundary import check_boundary
 from medisense.detectors.pain import PainDetector
 from medisense.smoothing import LabelSmoother
 from medisense.state import get_overall_state
+from medisense.ui.model import MonitorSnapshot
 from medisense.ui.render import render
+from medisense.vision.capture import FILE, frame_position_msec, open_capture
 from medisense.vision.pose import PoseEstimator
 from medisense.vision.face import FaceFinder
 from medisense.vision.landmarks import face_center
@@ -77,11 +93,18 @@ def main() -> int:
     _install_signal_handlers(stop_flag)
 
     try:
-        alert = AlertManager(cfg)
-        pain_det = PainDetector(cfg)
-        agi_det = AgitationDetector(cfg)
+        try:
+            cap, source_kind, clock = open_capture(cfg.cam_source)
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.critical("%s", e)
+            return 1
+
+        alert = AlertManager(cfg, clock=clock)
+        pain_det = PainDetector(cfg, clock=clock)
+        agi_det = AgitationDetector(cfg, clock=clock)
         post_det = PostureDetector(cfg)
-        stil_det = StillnessDetector(cfg)
+        stil_det = StillnessDetector(cfg, clock=clock)
+        breath_det = BreathingDetector(cfg)
         fall_det = FallDetector(cfg)
         boundary_smooth = LabelSmoother(10, initial="CENTER")
         pose_est = PoseEstimator(cfg)
@@ -93,27 +116,21 @@ def main() -> int:
             return 1
 
         logger.info(
-            "Pose backend=%s | expression mode pending | headless=%s",
+            "Pose backend=%s | source=%s (%s) | clock=%s | headless=%s",
             pose_est.backend_name,
+            cfg.cam_source,
+            source_kind,
+            clock.kind,
             cfg.headless,
         )
 
-        cap = cv2.VideoCapture(cfg.cam_source)
-        if not cap.isOpened():
-            logger.critical("Cannot open camera source %s.", cfg.cam_source)
-            return 1
-
-        # Improve capture stability where drivers support it.
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-
         agi_v, agi_st, posture = 0.0, "READING", "READING"
-        still_dur, still_st, boundary_st = 0.0, "READING", "CENTER"
+        still_dur, still_st, boundary_st = 0.0, still_states.READING, "CENTER"
         cx, cy, state, msg = 0.5, 0.5, "NORMAL", "Patient stable"
-        face_vis, fallen, fall_ratio = False, False, 1.0
+        face_vis, fallen = False, False
         emotion, pain_score, pain_state = "neutral", 0.0, "NORMAL"
+        breathing = None
+        is_low_light = False
         pose_backend = pose_est.backend_name
         frame_count = 0
         consecutive_read_failures = 0
@@ -124,6 +141,15 @@ def main() -> int:
             ret, frame = cap.read()
 
             if not ret or frame is None:
+                if source_kind == FILE:
+                    # A file that runs out of frames has finished, not failed.
+                    if cfg.loop_video and frame_count > 0:
+                        logger.info("End of video — looping.")
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    logger.info("End of video after %d frames.", frame_count)
+                    break
+
                 consecutive_read_failures += 1
                 if consecutive_read_failures == 1 or consecutive_read_failures % 30 == 0:
                     logger.warning(
@@ -133,90 +159,94 @@ def main() -> int:
                 if consecutive_read_failures >= cfg.camera_fail_alert_frames:
                     alert.trigger(
                         "CRITICAL",
-                        "CAMERA OFFLINE",
+                        EVENT_CAMERA_OFFLINE,
                         "No frames received — monitoring degraded.",
                     )
+                # Keep confirmation advancing while the feed is down.
+                alert.tick()
                 if consecutive_read_failures >= cfg.camera_fail_exit_frames:
                     logger.critical("Camera unresponsive too long — shutting down.")
                     break
                 continue
 
             consecutive_read_failures = 0
-            alert.resolve("CAMERA OFFLINE")
+            alert.resolve(EVENT_CAMERA_OFFLINE)
 
             try:
                 if frame.ndim != 3 or frame.shape[0] < 64 or frame.shape[1] < 64:
                     logger.warning("Skipping undersized/invalid frame.")
                     continue
 
-                frame = cv2.convertScaleAbs(frame, alpha=0.82, beta=0)
-                frame, is_low_light, mean_lum = night_vision.process(frame)
+                now = clock.advance(frame_position_msec(cap) if source_kind == FILE else None)
+                frame, is_low_light, _mean_lum = night_vision.process(frame)
                 frame_count += 1
 
                 pose = pose_est.process(frame)
                 pose_backend = pose.backend or pose_est.backend_name
                 lms = pose.landmarks
                 raw_lms = pose.raw_landmarks
-                logger.info("DEBUG lms: %s items, sample=%s", len(lms) if lms else 0, lms[0] if lms else None)
 
-                face_vis, face_box, face_crop = face_finder.find(
+                face = face_finder.find(
                     frame, landmarks=lms, person_bbox=pose.person_bbox
                 )
+                face_vis = face.found
 
+                # Only real cascade detections are scored. A landmark-derived
+                # crop is a guess around the nose, and the classifier would
+                # happily label a pillow as distressed.
                 if (
-                    face_vis
-                    and face_crop is not None
+                    face.is_detection
+                    and face.crop is not None
                     and frame_count % cfg.emotion_every_n_frames == 0
                 ):
-                    pain_det.update(face_crop)
+                    pain_det.update(face.crop, is_detection=True)
                 emotion, pain_score, pain_state = pain_det.get()
-                # Never escalate pain while model is still loading.
+                expression_mode = pain_det.get_mode()
+                # Never escalate pain while the model is still loading.
                 if pain_state == "LOADING":
                     pain_state = "NORMAL"
 
+                alert.set_context(
+                    pose_backend=pose_backend,
+                    distress_score=pain_score,
+                    expression_mode=expression_mode,
+                )
+
                 if lms is not None:
                     consecutive_pose_misses = 0
-                    alert.resolve("POSE LOST")
+                    alert.resolve(EVENT_POSE_LOST)
 
-                    fallen, fall_ratio = fall_det.update(lms)
+                    fallen, _fall_ratio = fall_det.update(lms)
                     agi_v, agi_st = agi_det.update(lms)
                     posture, _ = post_det.update(lms)
+                    breathing = breath_det.update(frame, lms, now)
 
                     fc = face_center(lms) if face_vis else None
                     f_cx = fc[0] if fc else None
                     f_cy = fc[1] if fc else None
-                    still_dur, still_st = stil_det.update(lms, f_cx, f_cy)
+                    still_dur, still_st = stil_det.update(
+                        lms, f_cx, f_cy, breathing_state=breathing.state
+                    )
 
                     raw_boundary, cx, cy = check_boundary(lms, cfg)
                     boundary_st = boundary_smooth.update(raw_boundary)
-
-                    pose_est.draw(frame, pose)
-                    if face_box is not None:
-                        x, y, fw, fh = face_box
-                        cv2.rectangle(
-                            frame, (x, y), (x + fw, y + fh), (140, 210, 255), 1
-                        )
                 else:
                     consecutive_pose_misses += 1
                     if consecutive_pose_misses >= cfg.pose_miss_clear_frames:
                         fallen = False
-                        still_st = "READING"
+                        still_st = still_states.READING
                         still_dur = 0.0
                         agi_st = "READING"
                         boundary_st = "CENTER"
                         posture = "READING"
-                        for ev in (
-                            "FALL DETECTED",
-                            "UNCONSCIOUS",
-                            "HIGH AGITATION",
-                            "BED BOUNDARY",
-                            "POSTURE CHANGE",
-                        ):
+                        breath_det.reset()
+                        breathing = None
+                        for ev in PATIENT_EVENTS:
                             alert.resolve(ev)
                         if consecutive_pose_misses == cfg.pose_miss_clear_frames:
                             alert.trigger(
                                 "WARNING",
-                                "POSE LOST",
+                                EVENT_POSE_LOST,
                                 "Patient pose not detected — check camera / occlusion.",
                             )
 
@@ -228,85 +258,111 @@ def main() -> int:
                     if fallen:
                         alert.trigger(
                             "CRITICAL",
-                            "FALL DETECTED",
+                            EVENT_FALL,
                             "Patient may have fallen / left bed",
                         )
                     else:
-                        alert.resolve("FALL DETECTED")
+                        alert.resolve(EVENT_FALL)
 
-                    if still_st == "UNCONSCIOUS":
+                    # Stillness alone is sleep. Absent respiration is not.
+                    if still_st == still_states.NO_RESPIRATION:
                         alert.trigger(
                             "CRITICAL",
-                            "UNCONSCIOUS",
-                            f"No movement for {still_dur:.0f}s",
+                            EVENT_NO_RESPIRATION,
+                            f"Still {still_dur:.0f}s with no chest movement detected",
                         )
                     else:
-                        alert.resolve("UNCONSCIOUS")
+                        alert.resolve(EVENT_NO_RESPIRATION)
+
+                    if still_st == still_states.PROLONGED_STILL:
+                        alert.trigger(
+                            "WARNING",
+                            EVENT_STILLNESS_UNVERIFIED,
+                            f"Still {still_dur:.0f}s and respiration cannot be "
+                            f"measured ({getattr(breathing, 'reason', 'unknown')})",
+                        )
+                    else:
+                        alert.resolve(EVENT_STILLNESS_UNVERIFIED)
 
                     if agi_st == "HIGH":
                         alert.trigger(
                             "CRITICAL",
-                            "HIGH AGITATION",
+                            EVENT_AGITATION,
                             "Possible pain or distress",
                         )
                     else:
-                        alert.resolve("HIGH AGITATION")
+                        alert.resolve(EVENT_AGITATION)
 
                     if boundary_st != "CENTER":
                         alert.trigger(
                             "CRITICAL",
-                            "BED BOUNDARY",
+                            EVENT_BOUNDARY,
                             f"Patient near {boundary_st}",
                         )
                     else:
-                        alert.resolve("BED BOUNDARY")
+                        alert.resolve(EVENT_BOUNDARY)
 
                     if posture in ("SITTING UP", "ROLLING"):
                         alert.trigger(
                             "WARNING",
-                            "POSTURE CHANGE",
+                            EVENT_POSTURE,
                             f"Patient is {posture}",
                         )
                     else:
-                        alert.resolve("POSTURE CHANGE")
+                        alert.resolve(EVENT_POSTURE)
 
                 if pain_state == "CRITICAL":
                     alert.trigger(
                         "CRITICAL",
-                        "PAIN DETECTED",
-                        f"Emotion: {emotion} — {pain_score:.0%}",
+                        EVENT_PAIN,
+                        f"Emotion: {emotion} — {pain_score:.0%} ({expression_mode})",
                     )
                 else:
-                    alert.resolve("PAIN DETECTED")
+                    alert.resolve(EVENT_PAIN)
+
+                alert.tick()
 
                 if not cfg.headless:
                     render(
                         frame,
-                        agi_v,
-                        agi_st,
-                        posture,
-                        still_dur,
-                        still_st,
-                        boundary_st,
-                        cx,
-                        cy,
-                        state,
-                        msg,
-                        face_vis,
-                        fallen,
-                        fall_ratio,
-                        emotion,
-                        pain_score,
-                        pain_state,
-                        alert.get_log(),
+                        MonitorSnapshot(
+                            state=state,
+                            message=msg,
+                            respiration_state=getattr(breathing, "state", "NOT MEASURED"),
+                            respiration_bpm=getattr(breathing, "bpm", 0.0),
+                            respiration_reason=getattr(breathing, "reason", ""),
+                            stillness_state=still_st,
+                            stillness_sec=still_dur,
+                            posture=posture,
+                            agitation_state=agi_st,
+                            boundary_state=boundary_st,
+                            fallen=fallen,
+                            emotion=emotion,
+                            pain_score=pain_score,
+                            pain_state=pain_state,
+                            expression_mode=expression_mode,
+                            face_source=face.source,
+                            landmarks=raw_lms,
+                            person_bbox=pose.person_bbox,
+                            face_box=face.box,
+                            patient_cx=cx,
+                            patient_cy=cy,
+                            pose_backend=pose_backend,
+                            source_label=source_kind,
+                            low_light=is_low_light,
+                            alerts=alert.get_log(),
+                        ),
                         cfg,
-                        landmarks=raw_lms,
-                        pose_backend=pose_backend,
                     )
                     cv2.imshow(window_name, frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
+                    if key == ord("r"):
+                        # Re-arm the fall baseline after the bed or camera moves.
+                        logger.info("Operator requested fall recalibration.")
+                        fall_det.recalibrate()
+                        breath_det.reset()
             except Exception:
                 logger.exception("Error processing frame %d — skipping.", frame_count)
                 continue

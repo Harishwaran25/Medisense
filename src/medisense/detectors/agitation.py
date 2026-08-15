@@ -6,24 +6,25 @@ rolling time window. Sustained high movement suggests restlessness or
 distress rather than normal, brief repositioning.
 """
 from collections import deque
-import time
 import numpy as np
 
+from medisense.clock import WallClock
 from medisense.smoothing import Smoother, LabelSmoother
 from medisense.config import Thresholds, BODY_POINTS
 from medisense.vision.landmarks import snapshot_landmarks
 
 
 class AgitationDetector:
-    def __init__(self, cfg: Thresholds):
+    def __init__(self, cfg: Thresholds, clock=None):
         self.cfg = cfg
+        self.clock = clock or WallClock()
         self.history = deque()
         self.prev_lms = None
         self.val_smooth = Smoother(10)
         self.lbl_smooth = LabelSmoother(10, initial="CALM")
 
     def update(self, landmarks) -> tuple[float, str]:
-        now = time.time()
+        now = self.clock.now()
         if self.prev_lms is not None:
             diffs = [
                 np.sqrt(

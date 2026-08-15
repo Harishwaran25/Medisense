@@ -1,7 +1,18 @@
 """Fake landmark helpers so detector logic can be tested without a camera
 or MediaPipe/YOLO actually running."""
+import sys
+from pathlib import Path
+
 import pytest
-from medisense.config import Thresholds
+
+# `pytest tests/` should work straight from a clone. The pyproject sets
+# `pythonpath`, but that option needs pytest >= 7, so make the layout
+# discoverable here too rather than failing on collection.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from medisense.config import Thresholds  # noqa: E402
 
 
 class FakeLandmark:
@@ -40,6 +51,27 @@ def lying_patient(cx=0.5, cy=0.45, spread=0.18) -> list:
         23: (cx - spread / 2, cy + 0.02),
         24: (cx + spread / 2, cy + 0.02),
     })
+
+
+class FakeClock:
+    """Manually advanced clock, so duration logic is tested without sleeping."""
+
+    kind = "fake"
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float = 1.0) -> float:
+        self.t += seconds
+        return self.t
+
+
+@pytest.fixture
+def clock():
+    return FakeClock()
 
 
 @pytest.fixture

@@ -18,57 +18,89 @@ A few critical minutes of undetected distress can be the difference that matters
 
 ## Solution
 
-MediSense turns a passive camera feed into an active, self-verifying safety monitor. It combines YOLO-based pose estimation, MediaPipe landmark tracking, and a facial-emotion transformer to continuously assess patient state — and only escalates to a human when it's genuinely confident something is wrong.
+MediSense turns a passive camera feed into an active, self-verifying safety monitor. It combines YOLO-based pose estimation, MediaPipe landmark tracking, camera-based respiration estimation, and a facial-emotion transformer to continuously assess patient state — and only escalates to a human when it's genuinely confident something is wrong.
 
 ```
 ┌─────────────┐     ┌────────────────────┐     ┌─────────────────────┐
-│   Camera    │ ──▶ │   Vision Pipeline    │ ──▶ │   6 Detector          │
-│ (incl. low- │     │  YOLO-pose + 33-pt   │     │   Modules              │
-│  light)     │     │  MediaPipe landmarks │     │  fall / agitation /    │
+│  Camera /   │ ──▶ │   Vision Pipeline    │ ──▶ │   7 Detector          │
+│  file /     │     │  YOLO-pose + 33-pt   │     │   Modules              │
+│  RTSP       │     │  MediaPipe landmarks │     │  fall / agitation /    │
 └─────────────┘     │  + face tracking     │     │  posture / boundary /  │
-                     └────────────────────┘     │  stillness / pain      │
+                     └────────────────────┘     │  stillness /            │
+                                                  │  respiration / pain    │
                                                   └──────────┬──────────┘
                                                              │
                      ┌───────────────────────────────────────┘
                      ▼
           ┌─────────────────────┐     ┌───────────────────────┐
           │  Smoothing + 3-stage  │ ──▶ │   Alert Manager          │
-          │  confirmation state   │     │  audio + SMS fallback,   │
-          │  machine (anti-false- │     │  automatic channel        │
+          │  confirmation with    │     │  audio + Telegram + SMS, │
+          │  decay (anti-false-   │     │  automatic channel        │
           │  alarm)               │     │  failover                 │
           └─────────────────────┘     └───────────────────────┘
                      │
                      ▼
           ┌─────────────────────┐
-          │  SQLite event log +   │
-          │  LLM shift summaries  │
+          │  SQLite event log    │ ──▶  `medisense-report` shift handover
           └─────────────────────┘
 ```
 
 ### Key design decisions
 
 - **Contactless** — pose and face landmarks replace wearables; works even on unconscious patients
-- **False-alarm suppression** — rolling-window signal smoothing, majority-vote label stabilization, and a 3-stage confirmation state machine before any alert fires
-- **Non-blocking distress detection** — a Hugging Face facial-emotion transformer runs on a background thread so it adds a signal without slowing the real-time detection loop
-- **Fault-tolerant alerting** — automatic connectivity detection with SMS-to-local-audio channel failover, so alert delivery isn't a single point of failure
-- **Auditability** — every event logged to SQLite, with LLM-generated shift summaries for staff handoff instead of raw logs
+- **Sleep is not an emergency** — stillness alone never escalates. A motionless patient is only critical when respiration cannot be detected either, so overnight monitoring doesn't bury staff in false alarms
+- **Says when it cannot tell** — if the chest is occluded, the room is too dark, or the stream has frozen, the system reports respiration as *unverified* rather than absent. "Can't measure" and "not breathing" are different answers and only one of them alarms
+- **False-alarm suppression** — rolling-window smoothing, majority-vote label stabilization, and a 3-stage confirmation that decays rather than resetting, so a one-frame dropout doesn't discard progress on a real event
+- **Signals are labelled by provenance** — the OpenCV expression fallback is capped at WARNING and can never raise a critical alert; every logged event records which pose backend and which expression path produced it
+- **Expressions are only read from faces** — a classifier returns a confident-looking label for any image, so only true face detections are scored, side-lying faces are rotated upright first, and crops that are too small, too blurred, or too uncertain report `UNCERTAIN` or `NOT ASSESSED` instead of a number
+- **Maintained baselines** — the fall detector rejects a calibration window the patient moved through and absorbs repositioning, without letting drift swallow a genuine slow slide
+- **Measurable offline** — any video file or RTSP URL can be used as the source, replayed against a video clock so second-based thresholds mean the same thing as on a live feed
+- **Fault-tolerant alerting** — Telegram with SMS and local-audio fallback, so alert delivery isn't a single point of failure
 
 ## Features
 
 | Detector | Signal |
 |---|---|
-| **Fall** | Torso-drop-toward-floor detection via pose ratio |
+| **Fall** | Torso drop / lateral ejection / tumble vs a maintained lying baseline |
 | **Agitation** | Rolling-window movement variance |
 | **Posture** | Sitting up / rolling / lying classification |
-| **Stillness** | Prolonged inactivity → unconsciousness risk |
-| **Pain** | Facial-emotion transformer, background-thread inference |
+| **Stillness** | How long the patient has been motionless (sleep-aware, never critical alone) |
+| **Respiration** | Chest-region intensity oscillation in the plausible breathing band |
+| **Pain** | Facial-emotion transformer on detected, upright-corrected faces only |
 | **Bed boundary** | Left/right edge proximity, center-safe zone tracking |
 
+Patient state resolves as:
+
+| Condition | Reported as |
+|---|---|
+| Still, breathing detected | `ASLEEP` — normal |
+| Still, no breathing detected | `NO RESPIRATION` — critical |
+| Still, respiration unmeasurable | `PROLONGED STILL` — warning, after a long delay |
+
 Additional capabilities:
-- Low-light / night-vision frame enhancement
+- Low-light / night-vision frame enhancement (CLAHE on the luminance channel)
 - YOLO ↔ MediaPipe pose backend with automatic failover
 - Live skeleton overlay for visual verification
 - Real-time clinical-style monitoring dashboard (OpenCV UI)
+
+### The overlay
+
+The panel shows the current verdict, the respiration reading, how long the
+patient has been still, and three state chips — and nothing else. Raw
+diagnostics go to `medisense.log`, not the screen, and readings the system
+cannot stand behind are printed as words rather than numbers:
+
+| Panel reads | Meaning |
+|---|---|
+| `15 BPM` | Respiration measured in the plausible breathing band |
+| `UNVERIFIED` | Chest occluded, room too dark, or stream frozen — not an apnoea claim |
+| `NOT DETECTED` | A full measurement window with no chest movement |
+| `NOT ASSESSED` | No clear view of the face; nothing was scored |
+| `UNCERTAIN` | A face was scored but the model's own confidence was below threshold |
+
+Tune the expression gates with `MEDISENSE_EMOTION_MIN_CONFIDENCE`,
+`MEDISENSE_EMOTION_MIN_FACE_PX`, and `MEDISENSE_EMOTION_MIN_SHARPNESS` if the
+panel reports expressions you don't trust, or reads `NOT ASSESSED` too often.
 
 ## Tech Stack
 
@@ -88,7 +120,32 @@ pip install -e .
 medisense
 ```
 
-Runs the live monitoring dashboard against your configured camera source. See `src/medisense/config.py` for environment-variable configuration (camera source, thresholds, pose backend, headless mode).
+Runs the live monitoring dashboard against your configured source. Press `Q` to quit, or `R` to re-arm the fall baseline after the bed or camera has been moved.
+
+### Choosing a source
+
+`MEDISENSE_CAM_SOURCE` accepts a webcam index, a video file, or a stream URL:
+
+```bash
+MEDISENSE_CAM_SOURCE=0                             medisense   # default webcam
+MEDISENSE_CAM_SOURCE=clips/night_roll.mp4          medisense   # recorded clip
+MEDISENSE_CAM_SOURCE=rtsp://cam.ward2/stream       medisense   # IP camera
+MEDISENSE_CAM_SOURCE=clips/sleep.mp4 MEDISENSE_LOOP_VIDEO=1 medisense
+```
+
+Files replay against a video clock derived from the container's own timestamps, so thresholds expressed in seconds behave the same during replay as on a live camera. That is what makes offline measurements comparable to live behaviour — see `docs/VALIDATION.md`.
+
+See `src/medisense/config.py` for the full set of thresholds and environment variables.
+
+### Shift handover report
+
+```bash
+medisense-report            # last 8 hours from medisense_events.db
+medisense-report 12         # last 12 hours
+medisense-report 8 /path/to/medisense_events.db
+```
+
+Uses Google Gemini if `GEMINI_API_KEY` is set, and a structured local synthesis otherwise.
 
 ## Testing
 
@@ -96,9 +153,11 @@ Runs the live monitoring dashboard against your configured camera source. See `s
 pytest tests/ -v
 ```
 
+The suite covers detector behaviour without needing a camera or model weights, and includes an end-to-end run of the main loop against a generated video clip.
+
 ## Project Status
 
-Portfolio project — actively developed. See `docs/VALIDATION.md` for validation methodology and `PROJECT_HANDOFF.txt` for architecture handoff notes.
+Portfolio project — actively developed, and **not a certified medical device**. Camera-based respiration estimation in particular is sensitive to lighting, bedding, camera angle and distance, and is unvalidated here; the pain score is a distress proxy, not a clinical pain scale. See `docs/VALIDATION.md` for the validation methodology and current status, and `PROJECT_HANDOFF.txt` for architecture handoff notes.
 
 ## License
 
