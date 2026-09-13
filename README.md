@@ -106,7 +106,7 @@ panel reports expressions you don't trust, or reads `NOT ASSESSED` too often.
 
 Python · OpenCV · Ultralytics YOLO (pose) · MediaPipe · Hugging Face Transformers · PyTorch · SQLite · pytest
 
-## Installation
+## Installation guide
 
 From the repository root:
 
