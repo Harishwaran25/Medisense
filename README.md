@@ -6,7 +6,7 @@ MediSense is a computer-vision based monitoring system for bedridden patients â€
 
 ---
 
-## Problem
+## Problem statement 
 
 Bedridden patients (elderly, post-surgical, ICU, or immobile patients) are at continuous risk of falls, unnoticed distress, agitation, or rolling off the bed â€” especially between nurse rounds. Existing options fall short:
 
