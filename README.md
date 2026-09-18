@@ -159,6 +159,19 @@ The suite covers detector behaviour without needing a camera or model weights, a
 
 Portfolio project — actively developed, and **not a certified medical device**. Camera-based respiration estimation in particular is sensitive to lighting, bedding, camera angle and distance, and is unvalidated here; the pain score is a distress proxy, not a clinical pain scale. See `docs/VALIDATION.md` for the validation methodology and current status, and `PROJECT_HANDOFF.txt` for architecture handoff notes.
 
+## Future Upgrades
+
+- Multi-camera support for monitoring multiple beds or rooms simultaneously
+- Web-based dashboard for remote monitoring and event review
+- Mobile and desktop notifications for critical alerts
+- Improved respiration and vital-sign estimation under challenging lighting and occlusion
+- Patient-specific calibration and adaptive detection thresholds
+- Integration with hospital information systems and nurse-call platforms
+- Long-term analytics for fall risk, sleep patterns, agitation, and recovery progress
+- Privacy-preserving edge processing with optional face anonymization
+- Expanded validation using real-world clinical datasets
+- Containerized deployment for easier installation on edge devices and cloud infrastructure
+
 ## License
 
 MIT
