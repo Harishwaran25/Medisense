@@ -2,7 +2,7 @@
 
 **Contactless AI-powered patient safety monitoring**
 
-MediSense is a computer-vision based monitoring system for bedridden patients — no wearables, no sensors on the patient. A single camera feed is enough to detect falls, agitation, unconsciousness, pain, and bed-boundary violations in real time, with fault-tolerant alerting to staff.
+MediSense is a computer-vision based monitoring system for bedridden patients -- no wearables, no sensors on the patient. A single camera feed is enough to detect falls, agitation, unconsciousness, pain, and bed-boundary violations in real time, with fault-tolerant alerting to staff.
 
 ---
 
