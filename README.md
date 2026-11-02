@@ -4,6 +4,48 @@
 
 MediSense is a computer-vision based monitoring system for bedridden patients -- no wearables, no sensors on the patient. A single camera feed is enough to detect falls, agitation, unconsciousness, pain, and bed-boundary violations in real time, with fault-tolerant alerting to staff.
 
+> Portfolio / learning project — **not a certified medical device**.
+
+---
+
+## Demo (for recruiters)
+
+Watch the annotated live overlay: **pose skeleton + clinical metrics panel** from a single camera.
+
+[![MediSense live demo — click to play](docs/demo/thumbnail.jpg)](docs/demo/medisense_demo.mp4)
+
+[**▶ Watch demo video (MP4)**](docs/demo/medisense_demo.mp4)
+
+![MediSense architecture](docs/architecture.png)
+
+**What the overlay shows**
+- YOLO pose skeleton on the patient
+- Overall safety verdict
+- Respiration reading, stillness duration, posture / agitation / boundary chips
+- Alerts only after 3-stage confirmation (anti-false-alarm)
+
+**Interview / live demo (2 minutes)**
+
+```bash
+pip install -e .
+MEDISENSE_CAM_SOURCE=0 medisense
+```
+
+Press `Q` to quit, `R` to re-arm the fall baseline after moving the camera.
+
+Suggested choreography: lie/sit still → sit up → fidget → move toward the frame edge → show the metrics panel.
+
+**Record your own clip for LinkedIn / applications**
+
+```bash
+MEDISENSE_CAM_SOURCE=0 \
+MEDISENSE_RECORD_PATH=docs/demo/medisense_demo.mp4 \
+MEDISENSE_RECORD_SECONDS=75 \
+medisense
+```
+
+One-liner pitch: *Contactless patient-safety monitor — one camera → YOLO pose + face analysis → fall / stillness / respiration / distress alerts, with false-alarm suppression and failover alerting.*
+
 ---
 
 ## Problem statement 
@@ -134,6 +176,17 @@ MEDISENSE_CAM_SOURCE=clips/sleep.mp4 MEDISENSE_LOOP_VIDEO=1 medisense
 ```
 
 Files replay against a video clock derived from the container's own timestamps, so thresholds expressed in seconds behave the same during replay as on a live camera. That is what makes offline measurements comparable to live behaviour — see `docs/VALIDATION.md`.
+
+### Recording an annotated demo
+
+```bash
+MEDISENSE_CAM_SOURCE=0 \
+MEDISENSE_RECORD_PATH=docs/demo/medisense_demo.mp4 \
+MEDISENSE_RECORD_SECONDS=75 \
+medisense
+```
+
+Writes the same skeleton + metrics overlay recruiters see in the README video. Omit `MEDISENSE_RECORD_SECONDS` to record until you press `Q`.
 
 See `src/medisense/config.py` for the full set of thresholds and environment variables.
 

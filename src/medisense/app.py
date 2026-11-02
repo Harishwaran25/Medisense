@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import time
+from pathlib import Path
 
 import cv2
 
@@ -89,6 +91,8 @@ def main() -> int:
     pain_det = None
     pose_est = None
     cap = None
+    recorder = None
+    show_window = False
     stop_flag = {"stop": False}
     _install_signal_handlers(stop_flag)
 
@@ -136,6 +140,40 @@ def main() -> int:
         consecutive_read_failures = 0
         consecutive_pose_misses = 0
         window_name = "MediSense | Patient Monitoring"
+        expression_mode = "unavailable"
+        recorder = None
+        record_started_at = None
+        show_window = not cfg.headless
+        want_overlay = show_window or bool(cfg.record_path)
+
+        if cfg.record_path:
+            out_path = Path(cfg.record_path).expanduser().resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            # Live inference is far slower than the camera's advertised FPS.
+            # Using the camera rate makes the saved demo play in fast-forward.
+            # File sources keep container FPS so replay duration stays honest.
+            src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if source_kind == FILE and src_fps > 1.0:
+                fps = src_fps
+            else:
+                fps = 12.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            recorder = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+            if not recorder.isOpened():
+                logger.critical("Could not open video writer at %s", out_path)
+                return 1
+            record_started_at = time.monotonic()
+            if cfg.record_seconds > 0:
+                logger.info(
+                    "Recording annotated demo to %s (%.1f fps, stop after %.0fs)",
+                    out_path,
+                    fps,
+                    cfg.record_seconds,
+                )
+            else:
+                logger.info("Recording annotated demo to %s (%.1f fps)", out_path, fps)
 
         while not stop_flag["stop"] and cap.isOpened():
             ret, frame = cap.read()
@@ -322,7 +360,7 @@ def main() -> int:
 
                 alert.tick()
 
-                if not cfg.headless:
+                if want_overlay:
                     render(
                         frame,
                         MonitorSnapshot(
@@ -354,6 +392,25 @@ def main() -> int:
                         ),
                         cfg,
                     )
+
+                if recorder is not None:
+                    # Keep writer size stable even if a source renegotiates mid-run.
+                    h, w = frame.shape[:2]
+                    if (w, h) != (width, height):
+                        frame = cv2.resize(frame, (width, height))
+                    recorder.write(frame)
+                    if (
+                        cfg.record_seconds > 0
+                        and record_started_at is not None
+                        and (time.monotonic() - record_started_at) >= cfg.record_seconds
+                    ):
+                        logger.info(
+                            "Reached MEDISENSE_RECORD_SECONDS=%.0f — stopping.",
+                            cfg.record_seconds,
+                        )
+                        break
+
+                if show_window:
                     cv2.imshow(window_name, frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
@@ -373,12 +430,18 @@ def main() -> int:
         logger.exception("Fatal error in MediSense main loop.")
         return 1
     finally:
+        if recorder is not None:
+            try:
+                recorder.release()
+                logger.info("Demo recording saved.")
+            except Exception:
+                logger.exception("Error closing video recorder.")
         if cap is not None:
             try:
                 cap.release()
             except Exception:
                 pass
-        if not cfg.headless:
+        if show_window:
             try:
                 cv2.destroyAllWindows()
             except Exception:

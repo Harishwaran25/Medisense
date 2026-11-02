@@ -100,6 +100,15 @@ class Thresholds:
     cam_source: str = field(default_factory=lambda: _env_source("MEDISENSE_CAM_SOURCE", "0"))
     loop_video: bool = field(default_factory=lambda: _env_bool("MEDISENSE_LOOP_VIDEO", False))
     headless: bool = field(default_factory=lambda: _env_bool("MEDISENSE_HEADLESS", False))
+    # When set, annotated frames (skeleton + metrics panel) are written here.
+    # Useful for recruiter demos without a separate screen recorder.
+    record_path: str = field(
+        default_factory=lambda: os.environ.get("MEDISENSE_RECORD_PATH", "").strip()
+    )
+    # Optional auto-stop after N seconds of recording (0 = until quit / EOF).
+    record_seconds: float = field(
+        default_factory=lambda: _env_float("MEDISENSE_RECORD_SECONDS", 0.0)
+    )
 
     pose_backend: str = field(
         default_factory=lambda: os.environ.get("MEDISENSE_POSE_BACKEND", "auto").strip().lower()
