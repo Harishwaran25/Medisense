@@ -8,14 +8,6 @@ MediSense is a computer-vision based monitoring system for bedridden patients --
 
 ---
 
-## Demo (for recruiters)
-
-Watch the annotated live overlay: **pose skeleton + clinical metrics panel** from a single camera.
-
-[![MediSense live demo — click to play](docs/demo/thumbnail.jpg)](docs/demo/medisense_demo.mp4)
-
-[**▶ Watch demo video (MP4)**](docs/demo/medisense_demo.mp4)
-
 ![MediSense architecture](docs/architecture.png)
 
 **What the overlay shows**
